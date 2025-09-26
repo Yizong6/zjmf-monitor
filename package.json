@@ -2,9 +2,9 @@
   "name": "zjmf-monitor",
   "version": "1.0.0",
   "type": "module",
-  "main": "app.js",
+  "main": "src/app.mjs",
   "scripts": {
-    "start": "node app.js"
+    "start": "node src/app.mjs"
   },
   "dependencies": {
     "node-fetch": "^3.3.2"
