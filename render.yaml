@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: zjmf-monitor
+    env: docker
+    # 用 GitHub Actions 推送到 Docker Hub 后，这里指向公开镜像
+    image: docker.io/${DOCKERHUB_USERNAME}/zjmf-monitor:latest
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /healthz
+    envVars:
+      - key: BOT_TOKEN
+        sync: false            # 在 Render 控制台里填入
+      - key: CHAT_IDS
+        value: "[\"123456789\", \"-1001234567890\"]"
+      - key: TARGETS_JSON
+        value: >-
+          [
+            { "url": "https://example.com/product-a", "titleRegex": "产品A[^<]{0,80}" },
+            { "url": "https://example.com/product-b", "titleRegex": "产品B[^<]{0,80}" }
+          ]
+      - key: INTERVAL_MS
+        value: "5000"
+      - key: DELETE_AFTER_SOLDOUT_SEC
+        value: "120"
+      - key: RESTOCK_IDLE_DELETE_SEC
+        value: "300"
+      - key: SUMMARY_REFRESH_SEC
+        value: "120"
+      - key: SUMMARY_DELETE_IF_ALL_ZERO_SEC
+        value: "600"
