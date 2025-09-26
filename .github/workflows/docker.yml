@@ -13,6 +13,7 @@ jobs:
       contents: read
       packages: write
     env:
+      # 仅当要推 Docker Hub 时需要；没配也没关系
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
 
@@ -20,9 +21,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 读取版本号（也可改成 node -p "require('./package.json').version"）
       - name: Read package.json version
         id: pkg
         run: echo "ver=$(jq -r .version package.json)" >> "$GITHUB_OUTPUT"
+
+      # 计算全小写的 repo 和 dockerhub 用户名，供后续 tags 使用
+      - name: Compute lowercase names
+        id: vars
+        shell: bash
+        run: |
+          echo "repo_lc=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "dh_user_lc=${DOCKERHUB_USERNAME,,}" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -45,16 +55,16 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ghcr.io/${{ github.repository }}:latest
-            ghcr.io/${{ github.repository }}:v${{ steps.pkg.outputs.ver }}
-            ghcr.io/${{ github.repository }}:${{ github.sha }}
+            ghcr.io/${{ steps.vars.outputs.repo_lc }}:latest
+            ghcr.io/${{ steps.vars.outputs.repo_lc }}:v${{ steps.pkg.outputs.ver }}
+            ghcr.io/${{ steps.vars.outputs.repo_lc }}:${{ github.sha }}
 
-      # 可选：Docker Hub（只有在设置了 secrets 时才执行）
+      # 可选：Docker Hub（只有在设置了 secrets 时才执行；同样用小写用户名）
       - name: Login to Docker Hub
         if: ${{ env.DOCKERHUB_USERNAME && env.DOCKERHUB_TOKEN }}
         uses: docker/login-action@v3
         with:
-          username: ${{ env.DOCKERHUB_USERNAME }}
+          username: ${{ steps.vars.outputs.dh_user_lc }}
           password: ${{ env.DOCKERHUB_TOKEN }}
 
       - name: Build & Push to Docker Hub
@@ -66,6 +76,6 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ${{ env.DOCKERHUB_USERNAME }}/zjmf-monitor:latest
-            ${{ env.DOCKERHUB_USERNAME }}/zjmf-monitor:v${{ steps.pkg.outputs.ver }}
-            ${{ env.DOCKERHUB_USERNAME }}/zjmf-monitor:${{ github.sha }}
+            ${{ steps.vars.outputs.dh_user_lc }}/zjmf-monitor:latest
+            ${{ steps.vars.outputs.dh_user_lc }}/zjmf-monitor:v${{ steps.pkg.outputs.ver }}
+            ${{ steps.vars.outputs.dh_user_lc }}/zjmf-monitor:${{ github.sha }}
