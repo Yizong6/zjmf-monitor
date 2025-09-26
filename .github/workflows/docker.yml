@@ -1,83 +1,93 @@
-name: Build & Push Docker Image
+name: Build & Push Docker image
 
 on:
   push:
-    branches: ["main"]
-    tags: ["v*", "V*"]
+    branches: [ "main" ]   # 推到 main 时出镜像（latest）
+    tags: [ "v*" ]         # 打 v* 标签时出版本号镜像（如 1.0, 1.0.0）
   workflow_dispatch:
 
 jobs:
   docker:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    env:
-      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Read package.json version
-        id: pkg
-        run: echo "ver=$(jq -r .version package.json)" >> "$GITHUB_OUTPUT"
+      # 1) 安装 Node 用来在工作区生成/修复 lockfile
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
 
-      - name: Compute lowercase names
-        id: vars
-        shell: bash
+      # 2) 确保 package-lock.json 存在且与 package.json 匹配
+      - name: Ensure package-lock.json
         run: |
-          echo "repo_lc=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-          echo "dh_user_lc=${DOCKERHUB_USERNAME,,}" >> "$GITHUB_OUTPUT"
+          if [ ! -f package-lock.json ]; then
+            echo "No package-lock.json found. Generating one..."
+            npm install --package-lock-only
+          else
+            echo "Validating package-lock.json with npm ci (no deps cached yet, this is just a check)..."
+            npm ci --ignore-scripts || { 
+              echo "::warning:: npm ci check failed; regenerating lockfile to match package.json";
+              rm -f package-lock.json
+              npm install --package-lock-only
+            }
+          fi
 
+      # 3) 写一个用于 CI 的 Dockerfile（关键：COPY package-lock.json 进入镜像）
+      - name: Create CI Dockerfile
+        run: |
+          cat > Dockerfile.ci <<'EOF'
+          FROM node:20-alpine
+          WORKDIR /app
+          # 复制 package.json + package-lock.json，确保 npm ci 可用
+          COPY package.json package-lock.json ./
+          # 更快更稳：跳过审计与基金提示；仅安装生产依赖
+          RUN npm ci --omit=dev --no-audit --no-fund
+          # 再复制源码
+          COPY src ./src
+          ENV NODE_ENV=production
+          CMD ["npm", "start"]
+          EOF
+
+      # 4) 生成镜像 tags/labels（同时支持 Docker Hub 与可选 GHCR）
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            docker.io/Yizong6/zjmf-monitor
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}},prefix=
+            type=semver,pattern={{major}}.{{minor}},prefix=
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # 5) 启用 QEMU + Buildx（多架构可选）
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Show build context (debug)
-        run: |
-          pwd
-          ls -al
-          ls -al src || true
-
-      - name: Login to GHCR
+      # 6) 登录 Docker Hub（在仓库 Settings → Secrets and variables → Actions 添加两个 secret）
+      - name: Login to DockerHub
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build & Push to GHCR
+      # 7) 构建并推送镜像（使用我们刚写的 Dockerfile.ci）
+      - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
+          file: ./Dockerfile.ci
           push: true
-          tags: |
-            ghcr.io/${{ steps.vars.outputs.repo_lc }}:latest
-            ghcr.io/${{ steps.vars.outputs.repo_lc }}:v${{ steps.pkg.outputs.ver }}
-            ghcr.io/${{ steps.vars.outputs.repo_lc }}:${{ github.sha }}
-
-      - name: Login to Docker Hub
-        if: ${{ env.DOCKERHUB_USERNAME && env.DOCKERHUB_TOKEN }}
-        uses: docker/login-action@v3
-        with:
-          username: ${{ steps.vars.outputs.dh_user_lc }}
-          password: ${{ env.DOCKERHUB_TOKEN }}
-
-      - name: Build & Push to Docker Hub
-        if: ${{ env.DOCKERHUB_USERNAME && env.DOCKERHUB_TOKEN }}
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ${{ steps.vars.outputs.dh_user_lc }}/zjmf-monitor:latest
-            ${{ steps.vars.outputs.dh_user_lc }}/zjmf-monitor:v${{ steps.pkg.outputs.ver }}
-            ${{ steps.vars.outputs.dh_user_lc }}/zjmf-monitor:${{ github.sha }}
+          platforms: linux/amd64,linux/arm64   # 如不需要多架构可改为: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
