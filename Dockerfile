@@ -2,12 +2,18 @@ FROM node:20-alpine
 
 WORKDIR /app
 
-# 只拷贝 package.json，避免锁文件要求
-COPY package.json ./
-RUN npm install --omit=dev --no-audit --no-fund
+# 先复制依赖清单以利用缓存
+COPY package*.json ./
 
-# 应用代码（单文件）
-COPY app.js ./
+# 有 lock 用 ci；没 lock 用 install（更稳）
+RUN if [ -f package-lock.json ]; then \
+      npm ci --omit=dev --no-audit --no-fund; \
+    else \
+      npm install --omit=dev --no-audit --no-fund; \
+    fi
+
+# 再复制其余代码（包含 src/app.mjs）
+COPY . .
 
 ENV NODE_ENV=production
 
