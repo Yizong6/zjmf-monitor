@@ -1,13 +1,12 @@
-// src/app.mjs
+// app.js
 /**
- * zjmf-monitor — Render Web Service 保活 + 业务规则强化
+ * zjmf-monitor — Render Web Service 保活 + 业务规则（旧版，无产品类型/价格/区域扩展）
  *
- * 需求实现：
- * 1) 售罄（库存=0）：立即删除旧“补货”消息，发送“无库存”消息；无库消息 2 分钟后自动删除
- * 2) 补货消息在“内容无变化”时，5 分钟后自动删除（有变化则续期）
- * 3) 汇总消息：若有任一库存>0则不删除；每2分钟自动刷新；
- *    若刷新后全部为0，则10分钟后自动删除；期间若再次出现库存>0则取消删除计划
- * 4) 美化通知格式（HTML）
+ * 规则：
+ * 1) 库存从 >0 -> 0：删除旧“补货”消息；发送“无库存”消息；无库存消息 2 分钟后自动删除
+ * 2) 补货消息若 5 分钟内“内容无变化”自动删除（有变化会续期）
+ * 3) 汇总消息：若有任一库存>0则不删除；每 2 分钟自动刷新；全部为0则 10 分钟后自动删除（出现>0取消删除）
+ * 4) Web Service 保活端口 /healthz（Render 用）
  */
 
 import http from "node:http";
@@ -36,14 +35,14 @@ if (PORT) {
 // ===== 配置（来自环境变量）=====
 const BOT_TOKEN = process.env.BOT_TOKEN || "";
 if (!BOT_TOKEN) {
-  console.error("ERROR: BOT_TOKEN 环境变量未设置。");
+  console.error("ERROR: BOT_TOKEN 未设置");
   process.exit(1);
 }
 
 const CHAT_IDS = (() => {
   const raw = process.env.CHAT_IDS || "";
   if (!raw) {
-    console.error("ERROR: CHAT_IDS 未设置。至少提供一个 chat id（私聊或群组）。");
+    console.error("ERROR: CHAT_IDS 未设置");
     process.exit(1);
   }
   try {
@@ -56,36 +55,21 @@ const CHAT_IDS = (() => {
 })();
 
 const INTERVAL_MS = Number(process.env.INTERVAL_MS || 5000);
-// 2 分钟删除无库存消息
-const DELETE_AFTER_SOLDOUT_SEC = Number(process.env.DELETE_AFTER_SOLDOUT_SEC || 120);
-// 5 分钟内若补货消息无变化则删除
-const RESTOCK_IDLE_DELETE_SEC = Number(process.env.RESTOCK_IDLE_DELETE_SEC || 300);
-// 汇总每 2 分钟自动刷新
-const SUMMARY_REFRESH_SEC = Number(process.env.SUMMARY_REFRESH_SEC || 120);
-// 汇总全部为 0 时，10 分钟后自动删除
-const SUMMARY_DELETE_IF_ALL_ZERO_SEC = Number(process.env.SUMMARY_DELETE_IF_ALL_ZERO_SEC || 600);
+const DELETE_AFTER_SOLDOUT_SEC = Number(process.env.DELETE_AFTER_SOLDOUT_SEC || 120);     // 无库消息2分钟删除
+const RESTOCK_IDLE_DELETE_SEC  = Number(process.env.RESTOCK_IDLE_DELETE_SEC  || 300);     // 补货无变化5分钟删除
+const SUMMARY_REFRESH_SEC      = Number(process.env.SUMMARY_REFRESH_SEC      || 120);     // 汇总2分钟自动刷新
+const SUMMARY_DELETE_IF_ALL_ZERO_SEC = Number(process.env.SUMMARY_DELETE_IF_ALL_ZERO_SEC || 600); // 全0十分钟删除
 
 // —— 仅从环境变量读取监控目标（必填）——
 let TARGETS;
 try {
   const raw = process.env.TARGETS_JSON;
-  if (!raw) {
-    console.error("ERROR: TARGETS_JSON 未设置。请提供 JSON 数组，例如：[{\"url\":\"...\",\"titleRegex\":\"...\"}]");
-    process.exit(1);
-  }
+  if (!raw) throw new Error("TARGETS_JSON 未设置");
   TARGETS = JSON.parse(raw);
-  if (!Array.isArray(TARGETS) || TARGETS.length === 0) {
-    console.error("ERROR: TARGETS_JSON 解析结果为空数组。");
-    process.exit(1);
-  }
-  for (const t of TARGETS) {
-    if (!t?.url) {
-      console.error("ERROR: TARGETS_JSON 中存在缺少 url 的条目。");
-      process.exit(1);
-    }
-  }
+  if (!Array.isArray(TARGETS) || TARGETS.length === 0) throw new Error("TARGETS_JSON 为空数组");
+  for (const t of TARGETS) if (!t?.url) throw new Error("TARGETS_JSON 中存在缺少 url 的条目");
 } catch (e) {
-  console.error("ERROR: 无法解析 TARGETS_JSON：", e?.message || e);
+  console.error("ERROR: 解析 TARGETS_JSON 失败：", e?.message || e);
   process.exit(1);
 }
 
@@ -155,8 +139,7 @@ ${time}`;
 }
 
 function fmtSummaryHeader() {
-  return `${titleBanner("实时库存汇总")}  
-⏱ 每 2 分钟自动刷新`;
+  return `${titleBanner("实时库存汇总")}  \n⏱ 每 2 分钟自动刷新`;
 }
 
 // ===== Telegram API（Long Polling）=====
@@ -191,59 +174,6 @@ async function tgAnswer(cb_id,text=""){
   await fetch(api,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({callback_query_id:cb_id,text})});
 }
 
-// ===== Long Polling =====
-async function pollUpdatesLoop(){
-  while(!stopFlag){
-    try{
-      const r=await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?timeout=30&offset=${pollOffset}`);
-      const data=await r.json().catch(()=>({}));
-      if(data?.result?.length){
-        for(const upd of data.result){
-          pollOffset = upd.update_id + 1;
-          await handleUpdate(upd);
-        }
-      }
-    }catch{}
-    await sleep(400);
-  }
-}
-
-async function handleUpdate(upd){
-  const cb = upd.callback_query;
-  if(!cb) return;
-  const chat_id = String(cb.message.chat.id);
-  if(cb.data==="SUMMARY_NEW"){
-    await tgAnswer(cb.id,"正在生成新汇总…").catch(()=>{});
-    if (lastSummaryMsg[chat_id]) {
-      try { await tgDelete(chat_id, lastSummaryMsg[chat_id]); } catch {}
-      delete lastSummaryMsg[chat_id];
-    }
-    const { text, kb, hasAnyStock } = await buildSummaryText();
-    const mid = await tgSend(chat_id, text, { kb });
-    if (mid) {
-      lastSummaryMsg[chat_id] = mid;
-      lastSummaryRefreshAt[chat_id] = Date.now();
-      scheduleOrCancelSummaryDelete(chat_id, mid, hasAnyStock);
-    }
-  } else if (cb.data==="SUMMARY_REFRESH"){
-    await tgAnswer(cb.id,"已刷新").catch(()=>{});
-    const { text, kb, hasAnyStock } = await buildSummaryText();
-    const mid = lastSummaryMsg[chat_id];
-    if (mid) {
-      try { await tgEdit(chat_id, mid, text, { kb }); } catch {}
-      lastSummaryRefreshAt[chat_id] = Date.now();
-      scheduleOrCancelSummaryDelete(chat_id, mid, hasAnyStock);
-    } else {
-      const newMid = await tgSend(chat_id, text, { kb });
-      if (newMid) {
-        lastSummaryMsg[chat_id] = newMid;
-        lastSummaryRefreshAt[chat_id] = Date.now();
-        scheduleOrCancelSummaryDelete(chat_id, newMid, hasAnyStock);
-      }
-    }
-  }
-}
-
 // ===== 抓取 & 解析 =====
 async function fetchHtml(url){
   const r = await fetch(url,{headers:UA});
@@ -251,7 +181,7 @@ async function fetchHtml(url){
   return await r.text();
 }
 
-/** 增强标题识别（优先局部 titleRegex，其次全局同序，再次常见容器） */
+/** 解析：根据“库存：N”定位条目；标题优先用 titleRegex，就近 H 标签与常见容器兜底 */
 function parseItems(html, titleRegex){
   const items=[]; const stockRe=/库存\s*[:：]\s*(\d+)/gi;
   let titleRe=null;
@@ -259,8 +189,8 @@ function parseItems(html, titleRegex){
   const globalTitles=[];
   if(titleRe){
     let mt; while((mt=titleRe.exec(html))!==null){
-      const idx=mt.index; const text=(mt[1]||mt[0]||"").toString().trim();
-      globalTitles.push({idx,text});
+      const text=(mt[1]||mt[0]||"").toString().trim();
+      globalTitles.push({idx:mt.index,text});
     }
   }
   let m, idxItem=0;
@@ -275,7 +205,7 @@ function parseItems(html, titleRegex){
     if(!title){
       const win=html.slice(Math.max(0,pos-1000),pos);
       const h = win.match(/<h[1-6][^>]*>\s*([^<]{2,80})<\/h[1-6]>/i)
-             || win.match(/<div[^>]*class=["'][^"']*(?:card-title|product-title|plan-name)[^"']*["'][^>]*>\s*([^<]{2,120})<\/div>/i)
+             || win.match(/<div[^>]*class=["'][^"']*(?:card-title|product-title|plan-name|title)[^"']*["'][^>]*>\s*([^<]{2,120})<\/div>/i)
              || win.match(/data-title=["']([^"']{2,120})["']/i);
       if(h && h[1]) title=h[1].trim();
     }
@@ -333,31 +263,29 @@ async function checkAll(){
         if(restocked || soldout){
           const kbInStock = [
             [{ text:"🛒 立即购买", url:t.url }],
-            [{ text:"📊 查看汇总", callback_data:"SUMMARY_NEW" }]
+            [{ text:"📊 实时库存", callback_data:"SUMMARY_NEW" }]
           ];
           const kbOutStock = [
-            [{ text:"📊 查看汇总", callback_data:"SUMMARY_NEW" }]
+            [{ text:"📊 实时库存", callback_data:"SUMMARY_NEW" }]
           ];
 
           if(soldout){
-            // 1) 删除旧“补货”消息
+            // 删除旧补货消息；发缺货消息（2 分钟后删除）；解锁补货周期
             for(const chat_id of CHAT_IDS){
               const midOld = lastRestockMsg[chat_id]?.[key];
               if(midOld){ try{ await tgDelete(chat_id, midOld); }catch{} }
               if(lastRestockMsg[chat_id]) delete lastRestockMsg[chat_id][key];
 
-              // 2) 发送“无库存”消息（2 分钟后删除）
               const text = fmtSoldout(brand, it.title, last, curr);
               const mid = await tgSend(chat_id, text, { kb: kbOutStock, notify: true });
               if(mid) scheduleDelete(chat_id, mid, DELETE_AFTER_SOLDOUT_SEC, "soldout");
             }
-            // 解锁补货周期
             delete notifiedRestock[key];
 
           }else if(restocked){
-            // 新“在售期”消息，并设置 5 分钟无变化自动删除
+            // 新“在售期”消息（只提醒一次），并设置 5 分钟无变化自动删除
             for(const chat_id of CHAT_IDS){
-              if(notifiedRestock[key]) continue; // 本补货周期只提醒一次
+              if(notifiedRestock[key]) continue;
               const text = fmtRestock(brand, it.title, last, curr);
               const mid = await tgSend(chat_id, text, { kb: kbInStock, notify: true });
               if(mid) {
@@ -372,7 +300,7 @@ async function checkAll(){
           if (typeof last==="number" && last!==curr && curr>0){
             const kbInStock = [
               [{ text:"🛒 立即购买", url:t.url }],
-              [{ text:"📊 查看汇总", callback_data:"SUMMARY_NEW" }]
+              [{ text:"📊 实时库存", callback_data:"SUMMARY_NEW" }]
             ];
             const text = fmtRestock(brand, it.title, last, curr);
             for(const chat_id of CHAT_IDS){
@@ -391,7 +319,7 @@ async function checkAll(){
         }
       }
     }catch(e){
-      // 可选：console.error("Fetch error:", t.url, e.message);
+      // console.error("Fetch error:", t.url, e.message);
     }
   }
 
@@ -456,6 +384,59 @@ async function autoRefreshSummaries(){
   }
 }
 
+// ===== Long Polling =====
+async function pollUpdatesLoop(){
+  while(!stopFlag){
+    try{
+      const r=await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?timeout=30&offset=${pollOffset}`);
+      const data=await r.json().catch(()=>({}));
+      if(data?.result?.length){
+        for(const upd of data.result){
+          pollOffset = upd.update_id + 1;
+          await handleUpdate(upd);
+        }
+      }
+    }catch{}
+    await sleep(400);
+  }
+}
+
+async function handleUpdate(upd){
+  const cb = upd.callback_query;
+  if(!cb) return;
+  const chat_id = String(cb.message.chat.id);
+  if(cb.data==="SUMMARY_NEW"){
+    await tgAnswer(cb.id,"正在生成新汇总…").catch(()=>{});
+    if (lastSummaryMsg[chat_id]) {
+      try { await tgDelete(chat_id, lastSummaryMsg[chat_id]); } catch {}
+      delete lastSummaryMsg[chat_id];
+    }
+    const { text, kb, hasAnyStock } = await buildSummaryText();
+    const mid = await tgSend(chat_id, text, { kb });
+    if (mid) {
+      lastSummaryMsg[chat_id] = mid;
+      lastSummaryRefreshAt[chat_id] = Date.now();
+      scheduleOrCancelSummaryDelete(chat_id, mid, hasAnyStock);
+    }
+  } else if (cb.data==="SUMMARY_REFRESH"){
+    await tgAnswer(cb.id,"已刷新").catch(()=>{});
+    const { text, kb, hasAnyStock } = await buildSummaryText();
+    const mid = lastSummaryMsg[chat_id];
+    if (mid) {
+      try { await tgEdit(chat_id, mid, text, { kb }); } catch {}
+      lastSummaryRefreshAt[chat_id] = Date.now();
+      scheduleOrCancelSummaryDelete(chat_id, mid, hasAnyStock);
+    } else {
+      const newMid = await tgSend(chat_id, text, { kb });
+      if (newMid) {
+        lastSummaryMsg[chat_id] = newMid;
+        lastSummaryRefreshAt[chat_id] = Date.now();
+        scheduleOrCancelSummaryDelete(chat_id, newMid, hasAnyStock);
+      }
+    }
+  }
+}
+
 // ===== 启动 & 优雅退出 =====
 async function main(){
   console.log("启动：zjmf-monitor（Long Polling, Docker/Render Web Service）");
@@ -467,7 +448,6 @@ async function main(){
   }
   console.log("退出：任务停止。");
 }
-
 process.on("SIGTERM", ()=>{ stopFlag = true; });
 process.on("SIGINT",  ()=>{ stopFlag = true; });
 
