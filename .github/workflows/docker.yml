@@ -3,7 +3,7 @@ name: Build & Push Docker image
 on:
   push:
     branches: [ "main" ]   # 推到 main 时出镜像（latest）
-    tags: [ "v*" ]         # 打 v* 标签时出版本号镜像（如 1.0, 1.0.0）
+    tags: [ "v1.0" ]         # 打 v* 标签时出版本号镜像（如 1.0, 1.0.0）
   workflow_dispatch:
 
 jobs:
